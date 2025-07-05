@@ -25,6 +25,19 @@ import torch
 from torch.utils.data import DataLoader
 import numpy as np
 from sklearn.model_selection import train_test_split
+import sys
+import math
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+import deepspeed
+from accelerate import Accelerator
+import wandb
+from tqdm.auto import tqdm
+
+from create_model.model import GemmaForCausalLM, ModelConfig
+from slm_datagen.data_pipeline import CustomTokenizer
 
 # Setup logging
 logging.basicConfig(
@@ -166,6 +179,225 @@ def tokenize_function(examples, tokenizer, config):
         return_tensors="pt"
     )
 
+class TrainingArguments:
+    """훈련 설정"""
+    def __init__(
+        self,
+        output_dir: str = "outputs",
+        num_train_epochs: int = 3,
+        per_device_train_batch_size: int = 16,
+        per_device_eval_batch_size: int = 16,
+        gradient_accumulation_steps: int = 1,
+        learning_rate: float = 5e-5,
+        weight_decay: float = 0.01,
+        max_grad_norm: float = 1.0,
+        warmup_ratio: float = 0.1,
+        logging_steps: int = 100,
+        eval_steps: int = 500,
+        save_steps: int = 1000,
+        local_rank: int = -1,
+        fp16: bool = True,
+        bf16: bool = False,
+        deepspeed_config: Optional[str] = None,
+    ):
+        self.output_dir = output_dir
+        self.num_train_epochs = num_train_epochs
+        self.per_device_train_batch_size = per_device_train_batch_size
+        self.per_device_eval_batch_size = per_device_eval_batch_size
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.learning_rate = learning_rate
+        self.weight_decay = weight_decay
+        self.max_grad_norm = max_grad_norm
+        self.warmup_ratio = warmup_ratio
+        self.logging_steps = logging_steps
+        self.eval_steps = eval_steps
+        self.save_steps = save_steps
+        self.local_rank = local_rank
+        self.fp16 = fp16
+        self.bf16 = bf16
+        self.deepspeed_config = deepspeed_config
+
+class Trainer:
+    def __init__(
+        self,
+        model: GemmaForCausalLM,
+        args: TrainingArguments,
+        train_dataset: Dataset,
+        eval_dataset: Optional[Dataset] = None,
+        data_collator: Optional[DataCollatorForLanguageModeling] = None,
+    ):
+        self.args = args
+        self.train_dataset = train_dataset
+        self.eval_dataset = eval_dataset
+        
+        # Accelerator 초기화
+        self.accelerator = Accelerator(
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            mixed_precision="fp16" if args.fp16 else "bf16" if args.bf16 else "no",
+        )
+        
+        # 데이터 로더 설정
+        self.train_dataloader = DataLoader(
+            train_dataset,
+            batch_size=args.per_device_train_batch_size,
+            shuffle=True,
+            collate_fn=data_collator,
+        )
+        
+        if eval_dataset is not None:
+            self.eval_dataloader = DataLoader(
+                eval_dataset,
+                batch_size=args.per_device_eval_batch_size,
+                shuffle=False,
+                collate_fn=data_collator,
+            )
+        
+        # 옵티마이저 설정
+        no_decay = ["bias", "LayerNorm.weight"]
+        optimizer_grouped_parameters = [
+            {
+                "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+                "weight_decay": args.weight_decay,
+            },
+            {
+                "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+                "weight_decay": 0.0,
+            },
+        ]
+        self.optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+        
+        # 학습률 스케줄러 설정
+        num_update_steps_per_epoch = math.ceil(len(self.train_dataloader) / args.gradient_accumulation_steps)
+        max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+        num_warmup_steps = int(max_train_steps * args.warmup_ratio)
+        
+        self.lr_scheduler = get_linear_schedule_with_warmup(
+            optimizer=self.optimizer,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=max_train_steps,
+        )
+        
+        # DeepSpeed 설정 (A100 클러스터용)
+        if args.deepspeed_config is not None:
+            model, self.optimizer, _, _ = deepspeed.initialize(
+                model=model,
+                optimizer=self.optimizer,
+                config=args.deepspeed_config,
+            )
+        
+        # 모델, 옵티마이저, 데이터로더를 accelerator로 준비
+        self.model, self.optimizer, self.train_dataloader, self.lr_scheduler = self.accelerator.prepare(
+            model, self.optimizer, self.train_dataloader, self.lr_scheduler
+        )
+        
+        if self.eval_dataset is not None:
+            self.eval_dataloader = self.accelerator.prepare(self.eval_dataloader)
+        
+        self.completed_steps = 0
+        self.max_train_steps = max_train_steps
+        
+    def train(self):
+        """훈련 실행"""
+        # wandb 초기화
+        if self.accelerator.is_main_process:
+            wandb.init(project="slm-forest", name="gemma-style-10b")
+        
+        progress_bar = tqdm(
+            total=self.max_train_steps,
+            disable=not self.accelerator.is_local_main_process,
+        )
+        
+        for epoch in range(self.args.num_train_epochs):
+            self.model.train()
+            for step, batch in enumerate(self.train_dataloader):
+                with self.accelerator.accumulate(self.model):
+                    outputs = self.model(**batch)
+                    loss = outputs.loss
+                    self.accelerator.backward(loss)
+                    
+                    if self.accelerator.sync_gradients:
+                        self.accelerator.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
+                    
+                    self.optimizer.step()
+                    self.lr_scheduler.step()
+                    self.optimizer.zero_grad()
+                
+                if self.accelerator.sync_gradients:
+                    progress_bar.update(1)
+                    self.completed_steps += 1
+                
+                if self.completed_steps % self.args.logging_steps == 0:
+                    if self.accelerator.is_main_process:
+                        wandb.log(
+                            {
+                                "train_loss": loss.item(),
+                                "learning_rate": self.optimizer.param_groups[0]["lr"],
+                                "epoch": epoch,
+                                "step": self.completed_steps,
+                            }
+                        )
+                
+                if self.completed_steps % self.args.eval_steps == 0:
+                    self.evaluate()
+                
+                if self.completed_steps % self.args.save_steps == 0:
+                    self.save_model()
+                
+                if self.completed_steps >= self.max_train_steps:
+                    break
+        
+        # 최종 모델 저장
+        self.save_model()
+    
+    def evaluate(self):
+        """평가 실행"""
+        if self.eval_dataset is None:
+            return
+        
+        self.model.eval()
+        eval_loss = 0
+        eval_steps = 0
+        
+        for batch in self.eval_dataloader:
+            with torch.no_grad():
+                outputs = self.model(**batch)
+                loss = outputs.loss
+                eval_loss += loss.item()
+                eval_steps += 1
+        
+        eval_loss = eval_loss / eval_steps
+        perplexity = math.exp(eval_loss)
+        
+        if self.accelerator.is_main_process:
+            wandb.log(
+                {
+                    "eval_loss": eval_loss,
+                    "perplexity": perplexity,
+                    "step": self.completed_steps,
+                }
+            )
+        
+        self.model.train()
+    
+    def save_model(self):
+        """모델 저장"""
+        if not self.accelerator.is_main_process:
+            return
+        
+        output_dir = os.path.join(
+            self.args.output_dir,
+            f"checkpoint-{self.completed_steps}"
+        )
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # accelerator로 언래핑된 모델 저장
+        unwrapped_model = self.accelerator.unwrap_model(self.model)
+        unwrapped_model.save_pretrained(
+            output_dir,
+            is_main_process=self.accelerator.is_main_process,
+            save_function=self.accelerator.save,
+        )
+
 def main():
     """Main training function"""
     logger.info("Starting Phi-2 fine-tuning for Tax Law Q&A")
@@ -261,26 +493,14 @@ def main():
         gradient_accumulation_steps=config.gradient_accumulation_steps,
         learning_rate=config.learning_rate,
         weight_decay=config.weight_decay,
-        warmup_steps=config.warmup_steps,
+        warmup_ratio=0.1,
         logging_steps=config.logging_steps,
-        save_steps=config.save_steps,
         eval_steps=config.eval_steps,
-        eval_strategy="steps",
-        save_strategy="steps",
-        load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
-        greater_is_better=False,
+        save_steps=config.save_steps,
+        local_rank=-1,
         fp16=True,
         bf16=False,
-        dataloader_pin_memory=False,
-        remove_unused_columns=False,
-        push_to_hub=False,
-        report_to=config.report_to,
-        run_name=config.run_name,
-        save_total_limit=3,
-        logging_dir=f"{config.output_dir}/logs",
-        gradient_checkpointing=True,
-        optim="paged_adamw_32bit"
+        deepspeed_config="training/ds_config.json"
     )
     
     # Initialize trainer
@@ -290,7 +510,6 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         data_collator=data_collator,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=3)]
     )
     
     # Start training

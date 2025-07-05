@@ -4,3 +4,4 @@ tax-law-gen-raw-data/*
 .venv/
 .infer_env/
 
+model_serving/
