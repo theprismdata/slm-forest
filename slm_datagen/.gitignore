@@ -1,0 +1,6 @@
+fine-tunning-ds/*
+model/*
+tax-law-gen-raw-data/*
+.venv/
+.infer_env/
+
