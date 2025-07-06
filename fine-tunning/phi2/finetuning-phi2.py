@@ -74,7 +74,7 @@ class TrainingConfig:
     lora_dropout: float = 0.1
     
     # Dataset config
-    train_file: str = "fine-tunning-ds/distillation_legal_qa_dataset.json"
+    train_file: str = "../slm_datagen/fine-tunning-ds/distillation_legal_qa_dataset.json"
     validation_split: float = 0.1
     
     # Prompt template
