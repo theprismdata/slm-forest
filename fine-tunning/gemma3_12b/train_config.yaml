@@ -1,0 +1,87 @@
+# Gemma 3 12B Fine-tuning Configuration for Tax Law Q&A
+# Optimized for RunPod A100/H100 environment
+
+# Model Configuration
+model_name: "google/gemma-3-12b-it"  # 올바른 Gemma 3 12B 모델
+model_type: "gemma3"
+max_length: 2048
+padding: "max_length"
+truncation: true
+
+# Training Configuration - RunPod A100 최적화
+training_args:
+  output_dir: "/workspace/gemma3-12b-tax-law-finetuned"
+  num_train_epochs: 3
+  per_device_train_batch_size: 1  # A100 40GB 기준
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 32  # 효과적인 배치 크기 32
+  learning_rate: 5e-6  # 큰 모델에 맞게 더 낮은 학습률
+  weight_decay: 0.01
+  warmup_steps: 100
+  logging_steps: 5
+  save_steps: 250
+  eval_steps: 250
+  evaluation_strategy: "steps"
+  save_strategy: "steps"
+  load_best_model_at_end: true
+  metric_for_best_model: "eval_loss"
+  greater_is_better: false
+  fp16: true
+  bf16: false  # A100에서는 bf16 사용 가능하지만 호환성을 위해 fp16 사용
+  dataloader_pin_memory: false
+  remove_unused_columns: false
+  push_to_hub: false
+  report_to: "none"
+  run_name: "gemma3-12b-tax-law-qa-runpod"
+  group_by_length: true
+  ddp_find_unused_parameters: false
+  max_steps: 1000  # 최대 스텝 제한으로 비용 절약
+  save_total_limit: 3  # 체크포인트 개수 제한
+
+# LoRA Configuration - 대형 모델에 맞게 조정
+lora_config:
+  r: 64  # 더 큰 rank로 성능 향상
+  lora_alpha: 128
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+  lora_dropout: 0.05  # 드롭아웃 감소
+  bias: "none"
+  task_type: "CAUSAL_LM"
+
+# Dataset Configuration
+dataset:
+  train_file: "/workspace/fine-tunning-ds/distillation_legal_qa_dataset.json"
+  validation_split: 0.1
+  max_train_samples: 5000  # 비용 절약을 위한 샘플 제한
+  max_eval_samples: 500
+
+# Generation Configuration
+generation_config:
+  max_new_tokens: 512
+  do_sample: true
+  temperature: 0.7
+  top_p: 0.9
+  repetition_penalty: 1.1
+  pad_token_id: 0  # Gemma 모델의 패딩 토큰 ID
+  eos_token_id: 1  # Gemma 모델의 EOS 토큰 ID
+
+# Prompt Template - Gemma 3 형식으로 수정
+prompt_template: |
+  <start_of_turn>user
+  {question}<end_of_turn>
+  <start_of_turn>model
+  {answer}<end_of_turn>
+
+# Quantization Configuration - A100 최적화
+quantization:
+  load_in_4bit: true
+  bnb_4bit_use_double_quant: true
+  bnb_4bit_quant_type: "nf4"
+  bnb_4bit_compute_dtype: "float16"
+
+# Memory Optimization
+memory_optimization:
+  gradient_checkpointing: true
+  use_cache: false
+  torch_dtype: "float16"
+  device_map: "auto"
+  max_memory: {0: "38GB"}  # A100 40GB 기준 

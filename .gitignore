@@ -4,3 +4,4 @@ slm_datagen/tax-law-gen-raw-data/*
 .venv/
 .infer_env/
 model_serving/
+fine-tunning/.venv
